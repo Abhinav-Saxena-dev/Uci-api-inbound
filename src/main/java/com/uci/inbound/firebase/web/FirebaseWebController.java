@@ -4,8 +4,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.uci.adapter.firebase.web.FirebaseNotificationAdapter;
 import com.uci.adapter.firebase.web.inbound.FirebaseWebMessage;
-import com.uci.inbound.utils.XMsgProcessingUtil;
+import com.uci.dao.models.XMessageDAO;
 import com.uci.dao.repository.XMessageRepository;
+import com.uci.inbound.entity.DeliveryReport;
+import com.uci.inbound.repository.DeliveryReportRepository;
 import com.uci.utils.BotService;
 import com.uci.utils.cache.service.RedisCacheService;
 import com.uci.utils.kafka.SimpleProducer;
@@ -13,10 +15,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestMethod;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import javax.xml.bind.JAXBException;
 
@@ -24,6 +25,8 @@ import javax.xml.bind.JAXBException;
 @RestController
 @RequestMapping(value = "/firebase")
 public class FirebaseWebController {
+    @Autowired
+    private DeliveryReportRepository deliveryReportRepository;
 
     @Value("${inboundProcessed}")
     private String inboundProcessed;
@@ -53,28 +56,84 @@ public class FirebaseWebController {
     @Value("${messageReport}")
     public String topicReport;
 
+    /**
+     * this is Delivery Report for NL App
+     *
+     * @param message
+     * @throws JsonProcessingException
+     * @throws JAXBException
+     */
     @RequestMapping(value = "/web", method = RequestMethod.POST, consumes = MediaType.APPLICATION_JSON_VALUE)
-    public void dikshaWeb(@RequestBody FirebaseWebMessage message) throws JsonProcessingException, JAXBException {
+    public void deliveryReport(@RequestBody FirebaseWebMessage message) throws JsonProcessingException, JAXBException, InterruptedException {
+        Flux.just(message)
+                .flatMap(this::processMessage)
+                .thenMany(Flux.empty())
+                .subscribe();
+    }
 
-        log.info("FirebaseWebController:dikshaWeb:: Request: " + mapper.writeValueAsString(message));
+    /**
+     * Checking external id and userid in Cache
+     *
+     * @param message
+     * @return
+     */
+    private Mono<Void> processMessage(FirebaseWebMessage message) {
+        if (message != null && message.getReport() != null && message.getReport().getExternalId() != null && !message.getReport().getExternalId().isEmpty()) {
+            String externalId = message.getReport().getExternalId();
+            String userId = message.getReport().getDestAdd();
+            return Mono.defer(() -> {
+                if (redisCacheService.isKeyExists(externalId + "_" + userId)) {
+                    log.info("FirebaseWebController:processMessage:: externalId found in cache : " + externalId + " for this user : " + userId);
+                    XMessageDAO xMessageDAO = (XMessageDAO) redisCacheService.getCache(externalId + "_" + userId);
+                    if (xMessageDAO != null) {
+                        return createDeliveryReport(xMessageDAO, message)
+                                .flatMap(this::saveDeliveryReport);
+                    }
+                } else {
+                    log.error("FirebaseWebController:processMessage:: externalId not found in cache : " + externalId + " for this user : " + userId);
+                }
+                return Mono.empty();
+            });
+        } else {
+            log.error("FirebaseWebController:processMessage:: Invalid Request - ExternalId or UserId not found in the request");
+            return Mono.empty();
+        }
+    }
 
-        firebaseNotificationAdapter = FirebaseNotificationAdapter.builder()
-                .botService(botService)
-                .build();
+    /**
+     * Inserting Delivery Report in PostgresDB
+     *
+     * @param deliveryReport
+     * @return
+     */
+    private Mono<Void> saveDeliveryReport(DeliveryReport deliveryReport) {
+        return deliveryReportRepository.save(deliveryReport)
+                .doOnError(error -> log.error("An error occurred: " + error.getMessage(), error))
+                .doOnSuccess(deliveryReport1 -> {
+                    if (deliveryReport1.getId() != null) {
+                        log.info("FirebaseWebController: Delivery Report Inserted Success : " + deliveryReport1);
+                    } else {
+                        log.error("FirebaseWebController: Delivery Report not Inserted : " + deliveryReport1);
+                    }
+                })
+                .then();
+    }
 
-        XMsgProcessingUtil.builder()
-                .adapter(firebaseNotificationAdapter)
-                .xMsgRepo(xmsgRepo)
-                .inboundMessage(message)
-                .topicFailure(inboundError)
-                .topicSuccess(inboundProcessed)
-                .kafkaProducer(kafkaProducer)
-                .botService(botService)
-                .redisCacheService(redisCacheService)
-                .topicOutbound(outboundTopic)
-                .topicReport(topicReport)
-                .build()
-                .process();
+    /**
+     * @param xMessageDAO
+     * @param message
+     * @return
+     */
+    private Mono<DeliveryReport> createDeliveryReport(XMessageDAO xMessageDAO, FirebaseWebMessage message) {
+        return Mono.just(DeliveryReport.builder()
+                .botId(xMessageDAO.getBotUuid().toString())
+                .botName(xMessageDAO.getApp())
+                .externalId(message.getReport().getExternalId())
+                .messageState(message.getEventType())
+                .fcmToken(message.getReport().getFcmDestAdd())
+                .userId(message.getReport().getDestAdd())
+                .cassId(xMessageDAO.getId().toString())
+                .build());
     }
 }
 
